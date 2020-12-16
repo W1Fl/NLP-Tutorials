@@ -10,14 +10,15 @@ import utils
 
 MODEL_DIM = 32
 MAX_LEN = 12
-N_LAYER = 3
+N_LAYER = 2
 N_HEAD = 4
 DataSize = 6400
-Batch_size = 8
+Batch_size = 64
 Learn_rate = 0.001
 Epochs = 50
 
-class MultiHead2(keras.layers.Layer):
+
+class MultiHead(keras.layers.Layer):
     def __init__(self, n_head):
         super().__init__()
         self.n_head = n_head
@@ -30,23 +31,20 @@ class MultiHead2(keras.layers.Layer):
         self.wk = self.add_weight('wk', [self.n_head, k_f, k_f])
         self.wv = self.add_weight('wv', [self.n_head, v_f, v_f])
         self.wo = self.add_weight('wo', [self.n_head * v_f, v_f])
-        super(MultiHead2, self).build(input_shape)
+        super(MultiHead, self).build(input_shape)
 
     def call(self, inputs, mask=None, **kwargs):
-        i_q, i_k, i_v = [i[:, tf.newaxis, ...] for i in inputs]
+        i_q, i_k, i_v = [i[:, tf.newaxis, ...] for i in inputs]  # add multihead axis
         q = i_q @ self.wq  # [b,h,s,f]
         k = i_k @ self.wk
         v = i_v @ self.wv
-        s = q @ tf.transpose(k, [0, 1, 3, 2]) / (tf.math.sqrt(self.k_f) + 1e-8)
-        # todo add mask
+        s = k @ tf.transpose(q, [0, 1, 3, 2]) / (tf.math.sqrt(self.k_f) + 1e-8)
         if mask is not None:
             s += mask * -1e9
         a = tf.nn.softmax(s)  # [b,h,attention,s]
         self.attention = a
         b = a @ v
-
-        o = tf.concat((tf.unstack(b, axis=1)), 2) @ self.wo
-
+        o = tf.concat(tf.unstack(b, axis=1), 2) @ self.wo
         return o
 
 
@@ -72,7 +70,7 @@ class EncodeLayer(keras.layers.Layer):
     def build(self, input_shape):
         model_dim = input_shape[-1]
         self.ln = [keras.layers.LayerNormalization() for _ in range(2)]
-        self.mh = MultiHead2(self.n_head)
+        self.mh = MultiHead(self.n_head)
         self.ffn = PositionWiseFFN(model_dim)
         super(EncodeLayer, self).build(input_shape)
 
@@ -107,17 +105,16 @@ class DecoderLayer(keras.layers.Layer):
         self.n_head = n_head
 
     def build(self, input_shape):
-        self.ln = [keras.layers.LayerNormalization((2,)) for _ in range(3)]
-        self.mh = [MultiHead2(self.n_head) for _ in range(2)]
+        self.mh = [MultiHead(self.n_head) for _ in range(2)]
         self.ffn = PositionWiseFFN(input_shape[-1])
+        self.ln = [keras.layers.LayerNormalization() for i in range(3)]
         super(DecoderLayer, self).build(input_shape)
 
     def call(self, inputs, look_ahead_mask=None, pad_mask=None, **kwargs):
         xz, yz = inputs
-        # todo decoder
         attn = self.mh[0]((yz, yz, yz), mask=look_ahead_mask)  # decoder self attention
-        o1 = self.ln[0](attn+yz)
-        attn = self.mh[1]((o1, xz, xz), mask=pad_mask)  # decoder + encoder attention
+        o1 = self.ln[0](attn + yz)
+        attn = self.mh[1]((o1, xz, xz), mask=look_ahead_mask)  # decoder + encoder attention
         o2 = self.ln[1](attn + o1)
         ffn = self.ffn(o2)
         o = self.ln[2](ffn + o2)
@@ -166,8 +163,8 @@ class PositionEmbedding(keras.layers.Layer):
         return x_embed
 
 
-class Transformer2(keras.Model):
-    def __init__(self, model_dim, max_len, n_encoder_layer, n_decoder_layer, n_head, n_vocab,i2v,v2i, padding_idx=0):
+class Transformer(keras.Model):
+    def __init__(self, model_dim, max_len, n_encoder_layer, n_decoder_layer, n_head, n_vocab, i2v, v2i, padding_idx=0):
         super().__init__()
         self.n_vocab = n_vocab
         self.n_decoder_layer = n_decoder_layer
@@ -176,28 +173,25 @@ class Transformer2(keras.Model):
         self.model_dim = model_dim
         self.max_len = max_len
         self.padding_idx = padding_idx
-        self.v2i=v2i
+        self.v2i = v2i
         self.i2v = i2v
-
 
     def build(self, input_shape):
         self.embed = PositionEmbedding(self.max_len, self.model_dim, self.n_vocab)
         self.encoder = Encoder(self.n_head, self.n_encoder_layer)
         self.decoder = Decoder(self.n_head, self.n_decoder_layer)
         self.o = keras.layers.Dense(self.n_vocab)
-        super(Transformer2, self).build(input_shape)
+        super(Transformer, self).build(input_shape)
 
-    def call(self, inputs,training=None, **kwargs):
+    def call(self, inputs, training=None, **kwargs):
         x, y = inputs
-        # if training:
-        x_embed,y_embed = self.embed(x), self.embed(y)
+        x_embed, y_embed = self.embed(x), self.embed(y)
         pad_mask = self._pad_mask(x)
         encoded_z = self.encoder(x_embed, mask=pad_mask)
         decoded_z = self.decoder(
             (y_embed, encoded_z), look_ahead_mask=self._look_ahead_mask(x), pad_mask=pad_mask)
         o = self.o(decoded_z)
         return o
-
 
     def _pad_mask(self, seqs):
         mask = tf.cast(tf.math.equal(seqs, self.padding_idx), tf.float32)
@@ -210,17 +204,17 @@ class Transformer2(keras.Model):
         return mask  # (step, step)
 
     def translate(self, src):
-        src=tf.expand_dims(src,0)
+        src = tf.expand_dims(src, 0)
         src_pad = utils.pad_zero(src, self.max_len)
-        tgt = utils.pad_zero(self.v2i["<GO>"]*tf.ones_like(src), self.max_len + 1)
+        tgt = utils.pad_zero([[self.v2i["<GO>"]]], self.max_len + 1)
         tgti = 0
         x_embed = self.embed(src_pad)
-        encoded_z = self.encoder(x_embed, mask=self._pad_mask(src_pad),training=True)
+        encoded_z = self.encoder(x_embed, mask=self._pad_mask(src_pad))
         while True:
             y = tgt[:, :-1]
             y_embed = self.embed(y)
             decoded_z = self.decoder(
-                (y_embed, encoded_z), look_ahead_mask=self._look_ahead_mask(y), pad_mask=self._pad_mask(y),training=True)
+                (y_embed, encoded_z), look_ahead_mask=self._look_ahead_mask(y), pad_mask=self._pad_mask(y))
             logit = self.o(decoded_z)[0, tgti, :].numpy()
             idx = np.argmax(logit)
             tgti += 1
@@ -229,17 +223,19 @@ class Transformer2(keras.Model):
                 break
         return "".join([self.i2v[i] for i in tgt[0]])
 
+
 class Loss(keras.losses.Loss):
-    def __init__(self,padding_idx=0):
+    def __init__(self, padding_idx=0):
         super().__init__()
         self.padding_idx = padding_idx
-        self.crossentropy=keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction="none")
+        self.crossentropy = keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction="none")
 
     def call(self, y_true, y_pred):
-        y_true=tf.reshape(y_true,[tf.shape(y_true)[0],tf.shape(y_true)[1]])
+        y_true = tf.reshape(y_true, [tf.shape(y_true)[0], tf.shape(y_true)[1]])
         pad_mask = tf.math.not_equal(y_true, self.padding_idx)
         loss = tf.reduce_mean(tf.boolean_mask(self.crossentropy(y_true, y_pred), pad_mask))
         return loss
+
 
 class myTensorboard(keras.callbacks.TensorBoard):
     def __init__(self, data, log_dir='logs/transformer', histogram_freq=1, write_graph=True, write_images=True,
@@ -247,19 +243,19 @@ class myTensorboard(keras.callbacks.TensorBoard):
         self.data = data
         super().__init__(log_dir=log_dir, histogram_freq=histogram_freq, write_graph=write_graph,
                          write_images=write_images, embeddings_freq=embeddings_freq, **kwargs)
+
     def on_epoch_end(self, epoch, logs=None):
         if (not epoch % 1):
             x, y, l = self.data.sample(1)
             x = utils.pad_zero(x, MAX_LEN)
-            y=utils.pad_zero(y,MAX_LEN)
-            res_=self.model(np.array([x,y]),training=True).numpy().argmax(2)
+            y = utils.pad_zero(y, MAX_LEN)
+            res_ = self.model(np.array([x, y])).numpy().argmax(2)
             res_ = self.data.idx2str(res_[0])
             res = self.model.translate(x[0])
             target = self.data.idx2str(y[0])
             src = self.data.idx2str(x[0])
             print(
                 '\n',
-                "t: ", epoch,
                 "| input: ", src,
                 "| target: ", target,
                 "| inference: ", res,
@@ -268,38 +264,22 @@ class myTensorboard(keras.callbacks.TensorBoard):
             )
         super(myTensorboard, self).on_epoch_end(epoch, logs)
 
+
 def load_data(data):
-    x,y,seq_len=data.sample(DataSize)
-    x=utils.pad_zero(x,MAX_LEN)
-    y=utils.pad_zero(y,MAX_LEN+1)
-    return (x,y[:,:-1]),y[:,1:]
+    x, y, seq_len = data.sample(DataSize)
+    x = utils.pad_zero(x, MAX_LEN)
+    y = utils.pad_zero(y, MAX_LEN + 1)
+    return (x, y[:, :-1]), y[:, 1:]
 
-def train(model:Transformer2, data):
-    x,y=load_data(data)
-    Loss()(y,model(x))
-    tb=myTensorboard(data)
-    model.compile(keras.optimizers.Adam(Learn_rate),loss=Loss())
-    model.fit(x,y,batch_size=Batch_size,epochs=Epochs,callbacks=[tb])
-    # model(x[:10],y[:10])
-    x=np.array([12, 12,  1,  4,  4,  1,  5,  4,  0,  0,  0,  0])
-    y=np.array([14, 5,  4,  2, 24,  2,  4, 12, 12, 12, 13,  0])
-    y_=np.array([ 5,  4,  2, 24,  2,  4, 12, 12, 12, 13,  0,  0])
-    a = model(np.array([[x], [y]]))[0].numpy().argmax(1)
-    a = model(np.array([[x], [y]]))[0].numpy().argmax(1)
-    a = model(np.array([[x], [y]]))[0].numpy().argmax(1)
-    a = model(np.array([[x], [y]]))[0].numpy().argmax(1)
-    a = model(np.array([[x], [y]]))[0].numpy().argmax(1)
-    a = model(np.array([[x], [y]]))[0].numpy().argmax(1)
-    a = model(np.array([[x], [y]]))[0].numpy().argmax(1)
 
-    print(model.translate(x))
-    print(model.translate(x))
-    print(model.translate(x))
-    print(model.translate(x))
-    # os.makedirs("./visual/models/transformer", exist_ok=True)
-    # model.save_weights("./visual/models/transformer/model.ckpt")
-    # with open("./visual/tmp/transformer_v2i_i2v.pkl", "wb") as f:
-    #     pickle.dump({"v2i": data.v2i, "i2v": data.i2v}, f)
+def train(model: Transformer, data):
+    x, y = load_data(data)
+    Loss()(y, model(x))
+    tb = myTensorboard(data)
+    model.compile(keras.optimizers.Adam(Learn_rate), loss=Loss())
+    model.fit(x, y, batch_size=Batch_size, epochs=Epochs, callbacks=[tb])
+    x = np.array([12, 12, 1, 4, 4, 1, 5, 4, 0, 0, 0, 0])
+    y = np.array([14, 5, 4, 2, 24, 2, 4, 12, 12, 12, 13, 0])
 
 
 if __name__ == "__main__":
@@ -308,15 +288,6 @@ if __name__ == "__main__":
     print("vocabularies: ", d.vocab)
     print("x index sample: \n{}\n{}".format(d.idx2str(d.x[0]), d.x[0]),
           "\ny index sample: \n{}\n{}".format(d.idx2str(d.y[0]), d.y[0]))
-
-    m = Transformer2(MODEL_DIM, MAX_LEN, N_LAYER, N_LAYER, N_HEAD, d.num_word,d.i2v,d.v2i)
-    bx, by, seq_len = d.sample(4)
-    bx = keras.preprocessing.sequence.pad_sequences(bx, MAX_LEN, padding='post')
-    by = keras.preprocessing.sequence.pad_sequences(by, MAX_LEN, padding='post')
+    m = Transformer(MODEL_DIM, MAX_LEN, N_LAYER, N_LAYER, N_HEAD, d.num_word, d.i2v, d.v2i)
     m.build([[None, 12], [None, 12]])
-    # m((bx, by))
-    # load_data(d)
-    train(m,d)
-
-    # m((bx,by))
-
+    train(m, d)
